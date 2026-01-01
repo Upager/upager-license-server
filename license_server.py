@@ -17,7 +17,7 @@ import os
 app = Flask(__name__)
 CORS(app)
 
-init_db()
+
 
 # Configure logging
 logging.basicConfig(
@@ -86,6 +86,8 @@ def init_db():
     conn.commit()
     conn.close()
     logging.info("Database initialized")
+
+init_db()
 
 def generate_license_key(tier='pro_lifetime'):
     """Generate a license key in format: UPAGER-XXXX-XXXX-XXXX-XXXX"""
