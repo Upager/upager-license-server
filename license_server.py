@@ -17,6 +17,8 @@ import os
 app = Flask(__name__)
 CORS(app)
 
+init_db()
+
 # Configure logging
 logging.basicConfig(
     level=logging.INFO,
@@ -530,7 +532,7 @@ def health():
     })
 
 if __name__ == '__main__':
-    init_db()
+    
     
     # Create sample licenses for testing
     conn = sqlite3.connect(DB_FILE)
