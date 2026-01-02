@@ -161,7 +161,7 @@ def activate():
             SELECT type, tier, billing_type, status, email, 
                    max_activations, current_activations, expires_at
             FROM licenses 
-            WHERE license_key = ?
+            WHERE UPPER(license_key) = UPPER(?)
         ''', (key,))
         
         license_row = c.fetchone()
@@ -302,9 +302,9 @@ def verify():
             SELECT l.type, l.tier, l.billing_type, l.status, l.expires_at,
                    a.status as activation_status, a.activated_at
             FROM licenses l
-            LEFT JOIN activations a ON l.license_key = a.license_key 
+            LEFT JOIN activations a ON UPPER(l.license_key) = UPPER(a.license_key) 
                 AND a.machine_id = ?
-            WHERE l.license_key = ?
+            WHERE UPPER(l.license_key) = UPPER(?)
         ''', (machine_id, key))
         
         row = c.fetchone()
@@ -413,7 +413,7 @@ def deactivate():
         # Check if activation exists
         c.execute('''
             SELECT id FROM activations
-            WHERE license_key = ? AND machine_id = ? AND status = 'active'
+            WHERE UPPER(license_key) = UPPER(?) AND machine_id = ? AND status = 'active'
         ''', (key, machine_id))
         
         if not c.fetchone():
@@ -426,7 +426,7 @@ def deactivate():
         c.execute('''
             UPDATE activations
             SET status = 'deactivated'
-            WHERE license_key = ? AND machine_id = ?
+            WHERE UPPER(license_key) = UPPER(?) AND machine_id = ?
         ''', (key, machine_id))
         
         # Decrement activation count
