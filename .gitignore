@@ -1,6 +1,10 @@
+
 __pycache__/
 *.pyc
 *.pyo
 *.log
 *.db
 .env
+
+# Backup files - keep these safe locally, never commit
+license_backup_*.json
