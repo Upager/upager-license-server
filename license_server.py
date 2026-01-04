@@ -525,6 +525,181 @@ def admin_stats():
     finally:
         conn.close()
 
+@app.route('/admin/backup', methods=['GET'])
+def admin_backup():
+    """Export entire database as JSON"""
+    
+    # Check admin secret from header or query param
+    admin_secret = request.headers.get('X-Admin-Secret') or request.args.get('secret')
+    if admin_secret != os.environ.get('UPAGER_ADMIN_SECRET', 'change-me'):
+        return jsonify({'success': False, 'error': 'Unauthorized'}), 401
+    
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    
+    try:
+        # Export licenses
+        c.execute('SELECT * FROM licenses')
+        licenses_cols = [desc[0] for desc in c.description]
+        licenses = [dict(zip(licenses_cols, row)) for row in c.fetchall()]
+        
+        # Export activations
+        c.execute('SELECT * FROM activations')
+        activations_cols = [desc[0] for desc in c.description]
+        activations = [dict(zip(activations_cols, row)) for row in c.fetchall()]
+        
+        backup_data = {
+            'backup_date': datetime.utcnow().isoformat(),
+            'licenses': licenses,
+            'activations': activations,
+            'counts': {
+                'licenses': len(licenses),
+                'activations': len(activations)
+            }
+        }
+        
+        logging.info(f"Database backup created: {len(licenses)} licenses, {len(activations)} activations")
+        
+        return jsonify({
+            'success': True,
+            'backup': backup_data
+        })
+        
+    except Exception as e:
+        logging.error(f"Backup error: {str(e)}")
+        return jsonify({
+            'success': False,
+            'error': str(e)
+        }), 500
+    finally:
+        conn.close()
+
+
+@app.route('/admin/restore', methods=['POST'])
+def admin_restore():
+    """Restore database from JSON backup"""
+    
+    data = request.get_json()
+    
+    # Check admin secret
+    admin_secret = data.get('admin_secret')
+    if admin_secret != os.environ.get('UPAGER_ADMIN_SECRET', 'change-me'):
+        return jsonify({'success': False, 'error': 'Unauthorized'}), 401
+    
+    backup_data = data.get('backup')
+    if not backup_data:
+        return jsonify({
+            'success': False,
+            'error': 'No backup data provided'
+        }), 400
+    
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    
+    try:
+        # Clear existing data
+        c.execute('DELETE FROM activations')
+        c.execute('DELETE FROM licenses')
+        
+        # Restore licenses
+        licenses = backup_data.get('licenses', [])
+        for lic in licenses:
+            c.execute('''
+                INSERT INTO licenses 
+                (id, license_key, email, type, tier, billing_type, status, 
+                 created_at, activated_at, expires_at, maintenance_expires_at, 
+                 max_activations, current_activations)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ''', (
+                lic['id'], lic['license_key'], lic['email'], lic['type'], 
+                lic['tier'], lic['billing_type'], lic['status'], lic['created_at'],
+                lic.get('activated_at'), lic.get('expires_at'), 
+                lic.get('maintenance_expires_at'), lic['max_activations'], 
+                lic['current_activations']
+            ))
+        
+        # Restore activations
+        activations = backup_data.get('activations', [])
+        for act in activations:
+            c.execute('''
+                INSERT INTO activations
+                (id, license_key, machine_id, ip_address, activated_at, 
+                 last_verified, status)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+            ''', (
+                act['id'], act['license_key'], act['machine_id'], 
+                act.get('ip_address'), act['activated_at'], 
+                act.get('last_verified'), act['status']
+            ))
+        
+        conn.commit()
+        
+        logging.info(f"Database restored: {len(licenses)} licenses, {len(activations)} activations")
+        
+        return jsonify({
+            'success': True,
+            'message': f'Restored {len(licenses)} licenses and {len(activations)} activations',
+            'counts': {
+                'licenses': len(licenses),
+                'activations': len(activations)
+            }
+        })
+        
+    except Exception as e:
+        conn.rollback()
+        logging.error(f"Restore error: {str(e)}")
+        return jsonify({
+            'success': False,
+            'error': str(e)
+        }), 500
+    finally:
+        conn.close()
+
+
+@app.route('/admin/licenses', methods=['GET'])
+def admin_list_licenses():
+    """Admin endpoint to list all licenses"""
+    
+    # Check admin secret from header or query param
+    admin_secret = request.headers.get('X-Admin-Secret') or request.args.get('secret')
+    if admin_secret != os.environ.get('UPAGER_ADMIN_SECRET', 'change-me'):
+        return jsonify({'success': False, 'error': 'Unauthorized'}), 401
+    
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    
+    try:
+        c.execute('''
+            SELECT license_key, email, type, tier, billing_type, status, 
+                   created_at, max_activations, current_activations, expires_at
+            FROM licenses
+            ORDER BY created_at DESC
+        ''')
+        
+        licenses = []
+        for row in c.fetchall():
+            licenses.append({
+                'license_key': row[0],
+                'email': row[1],
+                'type': row[2],
+                'tier': row[3],
+                'billing_type': row[4],
+                'status': row[5],
+                'created_at': row[6],
+                'max_activations': row[7],
+                'current_activations': row[8],
+                'expires_at': row[9]
+            })
+        
+        return jsonify({
+            'success': True,
+            'licenses': licenses,
+            'count': len(licenses)
+        })
+        
+    finally:
+        conn.close()
+
 @app.route('/health', methods=['GET'])
 def health():
     """Health check endpoint"""
