@@ -1,15 +1,15 @@
 #!/usr/bin/env python3
 """
-UPager License Creator - Works with admin_secret authentication
+UPager License Creator - Works with GitHub-backed server
 """
 
 import requests
 import sys
 import os
 
-# Admin secret from environment variable or hardcoded
+# Configuration
 ADMIN_SECRET = os.getenv('UPAGER_ADMIN_SECRET', 'SAV#311716872386192019')
-SERVER_URL = 'http://localhost:5001'
+SERVER_URL = os.getenv('SERVER_URL', 'https://upager-license-server.onrender.com')
 
 def create_license(email, tier="pro_lifetime", max_activations=1):
     """Create a new license with admin authentication"""
@@ -17,30 +17,28 @@ def create_license(email, tier="pro_lifetime", max_activations=1):
         response = requests.post(f'{SERVER_URL}/admin/create', 
             headers={'Content-Type': 'application/json'},
             json={
-                'admin_secret': ADMIN_SECRET,  # Required for authentication
+                'admin_secret': ADMIN_SECRET,
                 'email': email,
                 'tier': tier,
                 'max_activations': max_activations
-            }
+            },
+            timeout=30
         )
         
         if response.status_code == 200:
             data = response.json()
             if data.get('success'):
-                # Handle both response formats
-                license_key = data.get('license_key') or data.get('key')
+                license_key = data.get('license_key')
                 
                 print("\n✅ License Created Successfully!")
                 print("=" * 60)
                 print(f"License Key:      {license_key}")
                 print(f"Email:            {data.get('email')}")
                 print(f"Tier:             {data.get('tier', tier)}")
-                print(f"Type:             {data.get('type', 'N/A')}")
-                print(f"Max Activations:  {data.get('max_activations', max_activations)}")
-                if data.get('expires'):
-                    print(f"Expires:          {data.get('expires')}")
+                print(f"Max Activations:  {max_activations}")
                 print("=" * 60)
-                print(f"\n💾 Save this license key: {license_key}\n")
+                print(f"\n💾 Save this license key: {license_key}")
+                print(f"🔗 Backed up to GitHub automatically\n")
                 return data
             else:
                 print(f"❌ Error: {data.get('error')}")
@@ -53,56 +51,73 @@ def create_license(email, tier="pro_lifetime", max_activations=1):
     except requests.exceptions.ConnectionError:
         print(f"❌ Error: Cannot connect to server at {SERVER_URL}")
         print("Make sure the license server is running!")
-        print("\nStart it with: python license_server.py")
+        return None
+    except requests.exceptions.Timeout:
+        print(f"❌ Error: Request timeout (server may be waking up on Render)")
+        print("Try again in 30 seconds...")
         return None
     except Exception as e:
         print(f"❌ Unexpected error: {str(e)}")
         return None
 
-def list_licenses():
-    """List all licenses from the database"""
+def check_server_health():
+    """Check if server is healthy"""
     try:
-        import sqlite3
-        from pathlib import Path
-        
-        db_file = Path(__file__).parent / 'licenses.db'
-        if not db_file.exists():
-            print("❌ Database file not found!")
-            return
-        
-        conn = sqlite3.connect(db_file)
-        c = conn.cursor()
-        
-        c.execute('''
-            SELECT license_key, email, tier, status, created_at, 
-                   current_activations, max_activations
-            FROM licenses
-            ORDER BY created_at DESC
-        ''')
-        
-        rows = c.fetchall()
-        
-        if not rows:
-            print("\n📝 No licenses found in database")
-            return
-        
-        print("\n📋 All Licenses:")
-        print("=" * 100)
-        print(f"{'License Key':<30} {'Email':<25} {'Tier':<20} {'Status':<10} {'Acts':<8}")
-        print("-" * 100)
-        
-        for row in rows:
-            key, email, tier, status, created, current_acts, max_acts = row
-            acts = f"{current_acts}/{max_acts}"
-            print(f"{key:<30} {email:<25} {tier:<20} {status:<10} {acts:<8}")
-        
-        print("=" * 100)
-        print(f"Total licenses: {len(rows)}\n")
-        
-        conn.close()
-        
+        response = requests.get(f'{SERVER_URL}/health', timeout=10)
+        if response.status_code == 200:
+            data = response.json()
+            print("\n✅ Server Status:")
+            print("=" * 60)
+            print(f"Status:           {data.get('status')}")
+            print(f"GitHub:           {data.get('github')}")
+            print(f"Licenses:         {data.get('licenses')}")
+            print(f"Timestamp:        {data.get('timestamp')}")
+            print("=" * 60 + "\n")
+            return True
+        return False
     except Exception as e:
-        print(f"❌ Error listing licenses: {str(e)}")
+        print(f"❌ Server health check failed: {e}")
+        return False
+
+def manual_backup():
+    """Trigger manual backup to GitHub"""
+    try:
+        response = requests.post(f'{SERVER_URL}/admin/backup',
+            headers={'Content-Type': 'application/json'},
+            json={'admin_secret': ADMIN_SECRET},
+            timeout=30
+        )
+        
+        if response.status_code == 200:
+            data = response.json()
+            if data.get('success'):
+                print("\n✅ Manual backup to GitHub completed!")
+            else:
+                print(f"❌ Backup failed: {data.get('message')}")
+        else:
+            print(f"❌ HTTP Error {response.status_code}")
+    except Exception as e:
+        print(f"❌ Backup error: {e}")
+
+def manual_restore():
+    """Trigger manual restore from GitHub"""
+    try:
+        response = requests.post(f'{SERVER_URL}/admin/restore',
+            headers={'Content-Type': 'application/json'},
+            json={'admin_secret': ADMIN_SECRET},
+            timeout=30
+        )
+        
+        if response.status_code == 200:
+            data = response.json()
+            if data.get('success'):
+                print("\n✅ Manual restore from GitHub completed!")
+            else:
+                print(f"❌ Restore failed: {data.get('message')}")
+        else:
+            print(f"❌ HTTP Error {response.status_code}")
+    except Exception as e:
+        print(f"❌ Restore error: {e}")
 
 def show_usage():
     """Show usage instructions"""
@@ -110,7 +125,9 @@ def show_usage():
     print("=" * 60)
     print("\nUsage:")
     print("  python create_license.py <email> [tier] [max_activations]")
-    print("  python create_license.py list              # List all licenses")
+    print("  python create_license.py health            # Check server status")
+    print("  python create_license.py backup            # Manual GitHub backup")
+    print("  python create_license.py restore           # Manual GitHub restore")
     print("\nExamples:")
     print("  python create_license.py customer@example.com")
     print("  python create_license.py customer@example.com pro_annual")
@@ -121,6 +138,9 @@ def show_usage():
     print("  • pro_annual              - Pro with annual subscription")
     print("  • enterprise_lifetime     - Enterprise with lifetime license")
     print("  • enterprise_annual       - Enterprise with annual subscription")
+    print("\nEnvironment Variables:")
+    print(f"  SERVER_URL:          {SERVER_URL}")
+    print(f"  UPAGER_ADMIN_SECRET: {'Set' if ADMIN_SECRET else 'Not set'}")
     print()
 
 if __name__ == "__main__":
@@ -129,9 +149,17 @@ if __name__ == "__main__":
         show_usage()
         sys.exit(0)
     
-    # List licenses command
-    if sys.argv[1] == 'list':
-        list_licenses()
+    # Special commands
+    if sys.argv[1] == 'health':
+        check_server_health()
+        sys.exit(0)
+    
+    if sys.argv[1] == 'backup':
+        manual_backup()
+        sys.exit(0)
+    
+    if sys.argv[1] == 'restore':
+        manual_restore()
         sys.exit(0)
     
     # Parse arguments

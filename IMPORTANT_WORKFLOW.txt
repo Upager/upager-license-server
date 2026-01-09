@@ -1,0 +1,48 @@
+# Create license (automatically backs up to GitHub)
+python create_license.py customer@example.com pro_lifetime
+
+# Check server health
+python create_license.py health
+
+# Manual backup (if needed)
+python create_license.py backup
+
+# Manual restore (if needed)
+python create_license.py restore
+
+notepad IMPORTANT_WORKFLOW.txt
+```
+
+Paste:
+```
+🚨 UPAGER LICENSE SERVER - IMPORTANT WORKFLOW 🚨
+
+BEFORE ANY CODE CHANGES:
+========================
+1. python backup_database.py
+2. Verify backup file was created
+3. git add . && git commit -m "..." && git push
+4. Wait 3 minutes for Render to redeploy
+5. python restore_database.py
+
+DAILY OPERATIONS:
+=================
+# Create license
+python create_license.py <email> <tier> <activations>
+
+# Backup immediately after creating licenses!
+python backup_database.py
+
+# List all licenses
+python list_licenses.py
+
+WEEKLY SAFETY BACKUP:
+====================
+python backup_database.py
+# Then copy license_backup_latest.json to Google Drive/Dropbox
+
+RECOVERY (if database was wiped):
+==================================
+python restore_database.py
+
+⚠️  CRITICAL: Always backup before pushing code changes!

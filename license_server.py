@@ -1,47 +1,154 @@
 #!/usr/bin/env python3
 """
-UPager License Server - Hybrid Model (Lifetime + Annual)
-Supports: free, pro_lifetime, pro_annual, enterprise_lifetime, enterprise_annual
+UPager License Server - GitHub Persistence for Render Free Tier
+Optimized for minimal GitHub API calls and reliable data persistence
 """
 
 from flask import Flask, request, jsonify
 from flask_cors import CORS
 import sqlite3
-import hashlib
 import secrets
 import logging
 from datetime import datetime, timedelta
-from pathlib import Path
 import os
+import json
+import requests
+from base64 import b64encode, b64decode
+import time
 
 app = Flask(__name__)
 CORS(app)
 
-
-
-# Configure logging
 logging.basicConfig(
     level=logging.INFO,
-    format='%(asctime)s - %(levelname)s - %(message)s',
-    handlers=[
-        logging.FileHandler('license_server.log'),
-        logging.StreamHandler()
-    ]
+    format='%(asctime)s - %(levelname)s - %(message)s'
 )
 
-# Database setup
-DB_FILE = Path(__file__).parent / 'licenses.db'
+# ============================================
+# CONFIGURATION
+# ============================================
+
+# Paths (Render-safe /tmp directory)
+DB_FILE = "/tmp/licenses.db"
+
+# GitHub Configuration
+GITHUB_TOKEN = os.environ.get("GITHUB_TOKEN")
+GITHUB_REPO = os.environ.get("GITHUB_REPO", "Upager/upager-license-backup")
+GITHUB_BRANCH = os.environ.get("GITHUB_BRANCH", "main")
+GITHUB_FILE_PATH = "licenses.json"
+
+# Rate limiting for GitHub API (stay within free tier)
+LAST_BACKUP_TIME = 0
+BACKUP_COOLDOWN = 30  # seconds between backups
+MAX_RETRIES = 3
+
+# ============================================
+# GITHUB API FUNCTIONS (Direct API - No Git Clone)
+# ============================================
+
+def github_api_headers():
+    """Get headers for GitHub API"""
+    if not GITHUB_TOKEN:
+        return None
+    return {
+        "Authorization": f"token {GITHUB_TOKEN}",
+        "Accept": "application/vnd.github.v3+json"
+    }
+
+def get_file_from_github():
+    """Download licenses.json from GitHub using API"""
+    try:
+        if not GITHUB_TOKEN:
+            logging.warning("⚠️ No GitHub token - running without persistence")
+            return None
+        
+        url = f"https://api.github.com/repos/{GITHUB_REPO}/contents/{GITHUB_FILE_PATH}"
+        params = {"ref": GITHUB_BRANCH}
+        
+        response = requests.get(url, headers=github_api_headers(), params=params, timeout=10)
+        
+        if response.status_code == 404:
+            logging.info("📁 licenses.json doesn't exist yet - will create on first backup")
+            return {"licenses": [], "activations": []}
+        
+        if response.status_code == 200:
+            content = response.json()
+            data = json.loads(b64decode(content["content"]).decode("utf-8"))
+            logging.info(f"✅ Downloaded from GitHub: {len(data.get('licenses', []))} licenses")
+            return data
+        
+        logging.error(f"❌ GitHub download failed: {response.status_code}")
+        return None
+        
+    except Exception as e:
+        logging.error(f"❌ GitHub download error: {e}")
+        return None
+
+def save_file_to_github(data):
+    """Upload licenses.json to GitHub using API"""
+    global LAST_BACKUP_TIME
+    
+    try:
+        if not GITHUB_TOKEN:
+            logging.warning("⚠️ No GitHub token - skipping backup")
+            return False
+        
+        # Rate limiting
+        now = time.time()
+        if now - LAST_BACKUP_TIME < BACKUP_COOLDOWN:
+            logging.info("⏳ Backup cooldown active - skipping")
+            return True
+        
+        LAST_BACKUP_TIME = now
+        
+        # Get current file SHA (needed for updates)
+        url = f"https://api.github.com/repos/{GITHUB_REPO}/contents/{GITHUB_FILE_PATH}"
+        params = {"ref": GITHUB_BRANCH}
+        response = requests.get(url, headers=github_api_headers(), params=params, timeout=10)
+        
+        sha = None
+        if response.status_code == 200:
+            sha = response.json()["sha"]
+        
+        # Prepare content
+        content = json.dumps(data, indent=2)
+        encoded_content = b64encode(content.encode("utf-8")).decode("utf-8")
+        
+        # Upload/update file
+        payload = {
+            "message": f"Backup: {len(data.get('licenses', []))} licenses, {len(data.get('activations', []))} activations",
+            "content": encoded_content,
+            "branch": GITHUB_BRANCH
+        }
+        
+        if sha:
+            payload["sha"] = sha  # Update existing file
+        
+        response = requests.put(url, headers=github_api_headers(), json=payload, timeout=15)
+        
+        if response.status_code in [200, 201]:
+            logging.info(f"✅ Backed up to GitHub: {len(data.get('licenses', []))} licenses")
+            return True
+        else:
+            logging.error(f"❌ GitHub upload failed: {response.status_code} - {response.text}")
+            return False
+            
+    except Exception as e:
+        logging.error(f"❌ GitHub upload error: {e}")
+        return False
+
+# ============================================
+# DATABASE FUNCTIONS
+# ============================================
 
 def init_db():
-    """Initialize database with hybrid license support"""
+    """Initialize SQLite database"""
     conn = sqlite3.connect(DB_FILE)
     c = conn.cursor()
     
-    # Create licenses table
-    c.execute('''
+    c.execute("""
         CREATE TABLE IF NOT EXISTS licenses (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            license_key TEXT UNIQUE NOT NULL,
+            license_key TEXT PRIMARY KEY,
             email TEXT NOT NULL,
             type TEXT NOT NULL,
             tier TEXT NOT NULL,
@@ -50,14 +157,12 @@ def init_db():
             created_at TEXT NOT NULL,
             activated_at TEXT,
             expires_at TEXT,
-            maintenance_expires_at TEXT,
             max_activations INTEGER DEFAULT 1,
             current_activations INTEGER DEFAULT 0
         )
-    ''')
+    """)
     
-    # Create activations table
-    c.execute('''
+    c.execute("""
         CREATE TABLE IF NOT EXISTS activations (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             license_key TEXT NOT NULL,
@@ -66,665 +171,450 @@ def init_db():
             activated_at TEXT NOT NULL,
             last_verified TEXT,
             status TEXT NOT NULL,
-            FOREIGN KEY (license_key) REFERENCES licenses(license_key)
+            UNIQUE(license_key, machine_id)
         )
-    ''')
-    
-    # Create verification log
-    c.execute('''
-        CREATE TABLE IF NOT EXISTS verification_log (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            license_key TEXT NOT NULL,
-            machine_id TEXT NOT NULL,
-            ip_address TEXT,
-            timestamp TEXT NOT NULL,
-            result TEXT NOT NULL,
-            message TEXT
-        )
-    ''')
+    """)
     
     conn.commit()
     conn.close()
-    logging.info("Database initialized")
+    logging.info("✅ Database initialized")
 
-init_db()
-
-def generate_license_key(tier='pro_lifetime'):
-    """Generate a license key in format: UPAGER-XXXX-XXXX-XXXX-XXXX"""
-    # Generate 16 random hex characters
-    random_hex = secrets.token_hex(8).upper()
-    
-    # Split into 4 groups of 4
-    parts = [random_hex[i:i+4] for i in range(0, 16, 4)]
-    
-    # Create key
-    key = f"UPAGER-{'-'.join(parts)}"
-    
-    return key
-
-def create_license(email, tier, max_activations=1):
-    """Create a new license"""
+def export_db_to_json():
+    """Export current database to JSON format"""
     conn = sqlite3.connect(DB_FILE)
     c = conn.cursor()
     
-    key = generate_license_key(tier)
+    # Export licenses
+    c.execute("SELECT * FROM licenses")
+    cols = [d[0] for d in c.description]
+    licenses = [dict(zip(cols, row)) for row in c.fetchall()]
     
-    # Determine type and billing_type from tier
-    if tier.startswith('pro'):
-        license_type = 'pro'
-    elif tier.startswith('enterprise'):
-        license_type = 'enterprise'
-    else:
-        license_type = 'free'
+    # Export activations
+    c.execute("SELECT * FROM activations")
+    cols = [d[0] for d in c.description]
+    activations = [dict(zip(cols, row)) for row in c.fetchall()]
     
-    billing_type = 'one-time' if 'lifetime' in tier else 'annual'
+    conn.close()
+    
+    return {
+        "backup_date": datetime.utcnow().isoformat(),
+        "licenses": licenses,
+        "activations": activations
+    }
+
+def import_json_to_db(data):
+    """Import JSON data into database"""
+    if not data:
+        return False
     
     try:
-        c.execute('''
-            INSERT INTO licenses 
-            (license_key, email, type, tier, billing_type, status, created_at, max_activations)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-        ''', (key, email, license_type, tier, billing_type, 'active', 
-              datetime.utcnow().isoformat(), max_activations))
+        conn = sqlite3.connect(DB_FILE)
+        c = conn.cursor()
+        
+        # Clear existing data
+        c.execute("DELETE FROM activations")
+        c.execute("DELETE FROM licenses")
+        
+        # Import licenses
+        for lic in data.get("licenses", []):
+            c.execute("""
+                INSERT INTO licenses VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """, (
+                lic["license_key"], lic["email"], lic["type"], lic["tier"],
+                lic["billing_type"], lic["status"], lic["created_at"],
+                lic.get("activated_at"), lic.get("expires_at"),
+                lic["max_activations"], lic["current_activations"]
+            ))
+        
+        # Import activations
+        for act in data.get("activations", []):
+            c.execute("""
+                INSERT INTO activations (license_key, machine_id, ip_address, 
+                                        activated_at, last_verified, status)
+                VALUES (?, ?, ?, ?, ?, ?)
+            """, (
+                act["license_key"], act["machine_id"], act.get("ip_address"),
+                act["activated_at"], act["last_verified"], act["status"]
+            ))
         
         conn.commit()
-        logging.info(f"Created {tier} license: {key} for {email}")
+        conn.close()
+        
+        logging.info(f"✅ Restored: {len(data.get('licenses', []))} licenses, {len(data.get('activations', []))} activations")
+        return True
+        
+    except Exception as e:
+        logging.error(f"❌ Import failed: {e}")
+        return False
+
+# ============================================
+# STARTUP SEQUENCE
+# ============================================
+
+def startup_restore():
+    """Restore data from GitHub on startup"""
+    logging.info("🔄 Restoring data from GitHub...")
+    
+    init_db()
+    
+    data = get_file_from_github()
+    if data:
+        import_json_to_db(data)
+        return True
+    else:
+        logging.warning("⚠️ No GitHub data found - starting fresh")
+        return False
+
+# Run startup restore
+startup_restore()
+
+# ============================================
+# BACKUP HELPER
+# ============================================
+
+def backup_to_github():
+    """Backup current database to GitHub"""
+    data = export_db_to_json()
+    return save_file_to_github(data)
+
+# ============================================
+# LICENSE FUNCTIONS
+# ============================================
+
+def generate_license_key():
+    """Generate license key: UPAGER-XXXX-XXXX-XXXX-XXXX"""
+    hex_str = secrets.token_hex(8).upper()
+    parts = [hex_str[i:i+4] for i in range(0, 16, 4)]
+    return f"UPAGER-{'-'.join(parts)}"
+
+def create_license(email, tier, max_activations=1):
+    """Create new license"""
+    key = generate_license_key()
+    
+    license_type = "pro" if tier.startswith("pro") else "free"
+    billing_type = "one-time" if "lifetime" in tier else "annual"
+    
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    
+    try:
+        c.execute("""
+            INSERT INTO licenses VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """, (
+            key, email, license_type, tier, billing_type,
+            "active", datetime.utcnow().isoformat(),
+            None, None, max_activations, 0
+        ))
+        
+        conn.commit()
+        logging.info(f"✅ Created {tier} license: {key}")
+        
+        backup_to_github()
         return key
-    except sqlite3.IntegrityError:
-        logging.error(f"Failed to create license - key collision")
+        
+    except Exception as e:
+        logging.error(f"❌ License creation failed: {e}")
         return None
     finally:
         conn.close()
 
+# ============================================
+# API ENDPOINTS
+# ============================================
+
 @app.route('/activate', methods=['POST'])
 def activate():
-    """Activate a license on a machine"""
+    """Activate license on machine"""
     data = request.get_json()
     
-    key = data.get('key', '').strip()
+    key = data.get('key', '').strip().upper()
     email = data.get('email', '').strip()
     machine_id = data.get('machine_id', '').strip()
     ip = data.get('ip', request.remote_addr)
     
     if not all([key, email, machine_id]):
-        return jsonify({
-            'success': False,
-            'error': 'Missing required fields'
-        }), 400
+        return jsonify({"success": False, "error": "Missing fields"}), 400
     
     conn = sqlite3.connect(DB_FILE)
     c = conn.cursor()
     
     try:
-        # Get license info
-        c.execute('''
+        # Get license
+        c.execute("""
             SELECT type, tier, billing_type, status, email, 
                    max_activations, current_activations, expires_at
-            FROM licenses 
-            WHERE UPPER(license_key) = UPPER(?)
-        ''', (key,))
+            FROM licenses WHERE license_key = ?
+        """, (key,))
         
-        license_row = c.fetchone()
+        lic = c.fetchone()
+        if not lic:
+            return jsonify({"success": False, "error": "Invalid license"}), 404
         
-        if not license_row:
-            logging.warning(f"Activation failed: Invalid key {key}")
-            return jsonify({
-                'success': False,
-                'error': 'Invalid license key'
-            }), 404
+        (license_type, tier, billing_type, status, lic_email, 
+         max_activations, current_activations, expires_at) = lic
         
-        (license_type, tier, billing_type, status, license_email, 
-         max_activations, current_activations, expires_at) = license_row
+        if status != "active":
+            return jsonify({"success": False, "error": f"License is {status}"}), 403
         
-        # Check status
-        if status != 'active':
-            return jsonify({
-                'success': False,
-                'error': f'License is {status}'
-            }), 403
+        if email.lower() != lic_email.lower():
+            return jsonify({"success": False, "error": "Email mismatch"}), 403
         
-        # Check email match
-        if email.lower() != license_email.lower():
-            return jsonify({
-                'success': False,
-                'error': 'Email does not match license'
-            }), 403
-        
-        # Check if already activated on this machine
-        c.execute('''
-            SELECT status FROM activations
+        # Check existing activation
+        c.execute("""
+            SELECT id FROM activations 
             WHERE license_key = ? AND machine_id = ?
-        ''', (key, machine_id))
+        """, (key, machine_id))
         
         existing = c.fetchone()
         
         if existing:
-            # Already activated - update last verified
-            c.execute('''
-                UPDATE activations
-                SET last_verified = ?, ip_address = ?
+            # Update existing
+            c.execute("""
+                UPDATE activations 
+                SET last_verified = ?, ip_address = ?, status = 'active'
                 WHERE license_key = ? AND machine_id = ?
-            ''', (datetime.utcnow().isoformat(), ip, key, machine_id))
-            
-            logging.info(f"Re-activation: {key} on {machine_id}")
+            """, (datetime.utcnow().isoformat(), ip, key, machine_id))
         else:
-            # New activation - check limit
+            # New activation
             if current_activations >= max_activations:
-                return jsonify({
-                    'success': False,
-                    'error': f'Maximum activations ({max_activations}) reached'
-                }), 403
+                return jsonify({"success": False, "error": f"Max activations reached ({max_activations})"}), 403
             
-            # Create new activation
-            c.execute('''
-                INSERT INTO activations
+            c.execute("""
+                INSERT INTO activations 
                 (license_key, machine_id, ip_address, activated_at, last_verified, status)
                 VALUES (?, ?, ?, ?, ?, ?)
-            ''', (key, machine_id, ip, 
-                  datetime.utcnow().isoformat(), 
-                  datetime.utcnow().isoformat(), 
-                  'active'))
+            """, (key, machine_id, ip, datetime.utcnow().isoformat(), 
+                  datetime.utcnow().isoformat(), "active"))
             
-            # Increment activation count
-            c.execute('''
-                UPDATE licenses
+            c.execute("""
+                UPDATE licenses 
                 SET current_activations = current_activations + 1,
                     activated_at = COALESCE(activated_at, ?)
                 WHERE license_key = ?
-            ''', (datetime.utcnow().isoformat(), key))
-            
-            logging.info(f"New activation: {key} on {machine_id}")
-        
-        # Calculate expiry dates
-        now = datetime.utcnow()
-        
-        if billing_type == 'one-time':
-            # Lifetime licenses don't expire
-            license_expires = None
-            # Maintenance is 1 year from activation
-            maintenance_expires = (now + timedelta(days=365)).isoformat()
-        else:
-            # Annual licenses expire in 1 year
-            license_expires = (now + timedelta(days=365)).isoformat()
-            maintenance_expires = license_expires
-        
-        # Update license expiry if not set
-        if not expires_at and license_expires:
-            c.execute('''
-                UPDATE licenses
-                SET expires_at = ?
-                WHERE license_key = ?
-            ''', (license_expires, key))
+            """, (datetime.utcnow().isoformat(), key))
         
         conn.commit()
         
+        # Calculate expiry
+        now = datetime.utcnow()
+        if billing_type == "one-time":
+            license_expires = None
+            maintenance_expires = (now + timedelta(days=365)).isoformat()
+        else:
+            license_expires = (now + timedelta(days=365)).isoformat()
+            maintenance_expires = license_expires
+        
+        backup_to_github()
+        
         return jsonify({
-            'success': True,
-            'message': 'License activated successfully',
-            'license': {
-                'type': license_type,
-                'tier': tier,
-                'billing_type': billing_type,
-                'expires': license_expires,
-                'maintenance_expires': maintenance_expires
+            "success": True,
+            "license": {
+                "type": license_type,
+                "tier": tier,
+                "billing_type": billing_type,
+                "expires": license_expires,
+                "maintenance_expires": maintenance_expires
             }
         })
         
     except Exception as e:
-        logging.error(f"Activation error: {str(e)}")
-        return jsonify({
-            'success': False,
-            'error': 'Internal server error'
-        }), 500
+        logging.error(f"❌ Activation error: {e}")
+        return jsonify({"success": False, "error": "Internal error"}), 500
     finally:
         conn.close()
 
 @app.route('/verify', methods=['POST'])
 def verify():
-    """Verify a license"""
+    """Verify license"""
     data = request.get_json()
     
-    key = data.get('key', '').strip()
+    key = data.get('key', '').strip().upper()
     machine_id = data.get('machine_id', '').strip()
     
     if not all([key, machine_id]):
-        return jsonify({
-            'valid': False,
-            'error': 'Missing required fields'
-        }), 400
+        return jsonify({"valid": False, "error": "Missing fields"}), 400
     
     conn = sqlite3.connect(DB_FILE)
     c = conn.cursor()
     
     try:
-        # Get license and activation info
-        c.execute('''
+        c.execute("""
             SELECT l.type, l.tier, l.billing_type, l.status, l.expires_at,
                    a.status as activation_status, a.activated_at
             FROM licenses l
-            LEFT JOIN activations a ON UPPER(l.license_key) = UPPER(a.license_key) 
+            LEFT JOIN activations a ON l.license_key = a.license_key 
                 AND a.machine_id = ?
-            WHERE UPPER(l.license_key) = UPPER(?)
-        ''', (machine_id, key))
+            WHERE l.license_key = ?
+        """, (machine_id, key))
         
         row = c.fetchone()
-        
         if not row:
-            logging.warning(f"Verification failed: Invalid key {key}")
-            c.execute('''
-                INSERT INTO verification_log
-                (license_key, machine_id, timestamp, result, message)
-                VALUES (?, ?, ?, ?, ?)
-            ''', (key, machine_id, datetime.utcnow().isoformat(), 
-                  'failed', 'Invalid key'))
-            conn.commit()
-            
-            return jsonify({
-                'valid': False,
-                'error': 'Invalid license key'
-            })
+            return jsonify({"valid": False, "error": "Invalid license"})
         
         (license_type, tier, billing_type, license_status, 
          expires_at, activation_status, activated_at) = row
         
-        # Check license status
-        if license_status != 'active':
-            return jsonify({
-                'valid': False,
-                'error': f'License is {license_status}'
-            })
+        if license_status != "active":
+            return jsonify({"valid": False, "error": f"License {license_status}"})
         
-        # Check if activated on this machine
         if not activation_status:
-            return jsonify({
-                'valid': False,
-                'error': 'License not activated on this machine'
-            })
+            return jsonify({"valid": False, "error": "Not activated on this machine"})
         
-        # Check expiry for annual licenses
-        if billing_type == 'annual' and expires_at:
-            expiry_date = datetime.fromisoformat(expires_at)
-            if datetime.utcnow() > expiry_date:
-                return jsonify({
-                    'valid': False,
-                    'error': 'License has expired'
-                })
+        # Check expiry
+        if billing_type == "annual" and expires_at:
+            if datetime.utcnow() > datetime.fromisoformat(expires_at):
+                return jsonify({"valid": False, "error": "License expired"})
         
         # Update last verified
-        c.execute('''
-            UPDATE activations
+        c.execute("""
+            UPDATE activations 
             SET last_verified = ?
             WHERE license_key = ? AND machine_id = ?
-        ''', (datetime.utcnow().isoformat(), key, machine_id))
-        
-        # Log verification
-        c.execute('''
-            INSERT INTO verification_log
-            (license_key, machine_id, timestamp, result, message)
-            VALUES (?, ?, ?, ?, ?)
-        ''', (key, machine_id, datetime.utcnow().isoformat(), 
-              'success', f'Verified {tier}'))
+        """, (datetime.utcnow().isoformat(), key, machine_id))
         
         conn.commit()
         
         # Calculate maintenance expiry
-        if billing_type == 'one-time' and activated_at:
+        if billing_type == "one-time" and activated_at:
             activated_date = datetime.fromisoformat(activated_at)
             maintenance_expires = (activated_date + timedelta(days=365)).isoformat()
         else:
             maintenance_expires = expires_at
         
         return jsonify({
-            'valid': True,
-            'type': license_type,
-            'tier': tier,
-            'billing_type': billing_type,
-            'expires': expires_at,
-            'maintenance_expires': maintenance_expires
+            "valid": True,
+            "type": license_type,
+            "tier": tier,
+            "billing_type": billing_type,
+            "expires": expires_at,
+            "maintenance_expires": maintenance_expires
         })
         
     except Exception as e:
-        logging.error(f"Verification error: {str(e)}")
-        return jsonify({
-            'valid': False,
-            'error': 'Internal server error'
-        }), 500
+        logging.error(f"❌ Verification error: {e}")
+        return jsonify({"valid": False, "error": "Internal error"}), 500
     finally:
         conn.close()
 
 @app.route('/deactivate', methods=['POST'])
 def deactivate():
-    """Deactivate a license from a machine"""
+    """Deactivate license"""
     data = request.get_json()
     
-    key = data.get('key', '').strip()
+    key = data.get('key', '').strip().upper()
     machine_id = data.get('machine_id', '').strip()
     
     if not all([key, machine_id]):
-        return jsonify({
-            'success': False,
-            'error': 'Missing required fields'
-        }), 400
+        return jsonify({"success": False, "error": "Missing fields"}), 400
     
     conn = sqlite3.connect(DB_FILE)
     c = conn.cursor()
     
     try:
-        # Check if activation exists
-        c.execute('''
+        c.execute("""
             SELECT id FROM activations
-            WHERE UPPER(license_key) = UPPER(?) AND machine_id = ? AND status = 'active'
-        ''', (key, machine_id))
+            WHERE license_key = ? AND machine_id = ? AND status = 'active'
+        """, (key, machine_id))
         
         if not c.fetchone():
-            return jsonify({
-                'success': False,
-                'error': 'No active activation found'
-            }), 404
+            return jsonify({"success": False, "error": "No active activation"}), 404
         
-        # Deactivate
-        c.execute('''
-            UPDATE activations
+        c.execute("""
+            UPDATE activations 
             SET status = 'deactivated'
-            WHERE UPPER(license_key) = UPPER(?) AND machine_id = ?
-        ''', (key, machine_id))
+            WHERE license_key = ? AND machine_id = ?
+        """, (key, machine_id))
         
-        # Decrement activation count
-        c.execute('''
-            UPDATE licenses
+        c.execute("""
+            UPDATE licenses 
             SET current_activations = current_activations - 1
             WHERE license_key = ?
-        ''', (key,))
+        """, (key,))
         
         conn.commit()
-        logging.info(f"Deactivated: {key} from {machine_id}")
         
-        return jsonify({
-            'success': True,
-            'message': 'License deactivated successfully'
-        })
+        backup_to_github()
+        
+        return jsonify({"success": True, "message": "Deactivated"})
         
     except Exception as e:
-        logging.error(f"Deactivation error: {str(e)}")
-        return jsonify({
-            'success': False,
-            'error': 'Internal server error'
-        }), 500
+        logging.error(f"❌ Deactivation error: {e}")
+        return jsonify({"success": False, "error": "Internal error"}), 500
     finally:
         conn.close()
 
 @app.route('/admin/create', methods=['POST'])
 def admin_create():
-    """Admin endpoint to create licenses"""
+    """Admin: Create license"""
     data = request.get_json()
-
-    # Check admin secret
-    if data.get('admin_secret') != os.environ.get('UPAGER_ADMIN_SECRET', 'change-me'):
-        return jsonify({'success': False, 'error': 'Unauthorized'}), 401
-        
+    
+    if data.get('admin_secret') != os.environ.get('UPAGER_ADMIN_SECRET'):
+        return jsonify({"success": False, "error": "Unauthorized"}), 401
+    
     email = data.get('email', '').strip()
     tier = data.get('tier', 'pro_lifetime')
     max_activations = data.get('max_activations', 1)
     
     if not email:
-        return jsonify({
-            'success': False,
-            'error': 'Email required'
-        }), 400
+        return jsonify({"success": False, "error": "Email required"}), 400
     
     key = create_license(email, tier, max_activations)
     
     if key:
-        return jsonify({
-            'success': True,
-            'license_key': key,
-            'email': email,
-            'tier': tier
-        })
+        return jsonify({"success": True, "license_key": key, "email": email, "tier": tier})
     else:
-        return jsonify({
-            'success': False,
-            'error': 'Failed to create license'
-        }), 500
+        return jsonify({"success": False, "error": "Creation failed"}), 500
 
-@app.route('/admin/stats', methods=['GET'])
-def admin_stats():
-    """Get license statistics"""
-    conn = sqlite3.connect(DB_FILE)
-    c = conn.cursor()
-    
-    try:
-        # Total licenses by tier
-        c.execute('''
-            SELECT tier, billing_type, COUNT(*) as count
-            FROM licenses
-            WHERE status = 'active'
-            GROUP BY tier, billing_type
-        ''')
-        
-        by_tier = [{'tier': row[0], 'billing': row[1], 'count': row[2]} 
-                   for row in c.fetchall()]
-        
-        # Total activations
-        c.execute('SELECT COUNT(*) FROM activations WHERE status = "active"')
-        total_activations = c.fetchone()[0]
-        
-        # Recent verifications
-        c.execute('''
-            SELECT COUNT(*) FROM verification_log
-            WHERE timestamp > datetime('now', '-7 days')
-        ''')
-        recent_verifications = c.fetchone()[0]
-        
-        return jsonify({
-            'by_tier': by_tier,
-            'total_activations': total_activations,
-            'recent_verifications': recent_verifications
-        })
-        
-    finally:
-        conn.close()
-
-@app.route('/admin/backup', methods=['GET'])
+@app.route('/admin/backup', methods=['POST'])
 def admin_backup():
-    """Export entire database as JSON"""
+    """Admin: Manual backup"""
+    data = request.get_json()
     
-    # Check admin secret from header or query param
-    admin_secret = request.headers.get('X-Admin-Secret') or request.args.get('secret')
-    if admin_secret != os.environ.get('UPAGER_ADMIN_SECRET', 'change-me'):
-        return jsonify({'success': False, 'error': 'Unauthorized'}), 401
+    if data.get('admin_secret') != os.environ.get('UPAGER_ADMIN_SECRET'):
+        return jsonify({"success": False, "error": "Unauthorized"}), 401
     
-    conn = sqlite3.connect(DB_FILE)
-    c = conn.cursor()
-    
-    try:
-        # Export licenses
-        c.execute('SELECT * FROM licenses')
-        licenses_cols = [desc[0] for desc in c.description]
-        licenses = [dict(zip(licenses_cols, row)) for row in c.fetchall()]
-        
-        # Export activations
-        c.execute('SELECT * FROM activations')
-        activations_cols = [desc[0] for desc in c.description]
-        activations = [dict(zip(activations_cols, row)) for row in c.fetchall()]
-        
-        backup_data = {
-            'backup_date': datetime.utcnow().isoformat(),
-            'licenses': licenses,
-            'activations': activations,
-            'counts': {
-                'licenses': len(licenses),
-                'activations': len(activations)
-            }
-        }
-        
-        logging.info(f"Database backup created: {len(licenses)} licenses, {len(activations)} activations")
-        
-        return jsonify({
-            'success': True,
-            'backup': backup_data
-        })
-        
-    except Exception as e:
-        logging.error(f"Backup error: {str(e)}")
-        return jsonify({
-            'success': False,
-            'error': str(e)
-        }), 500
-    finally:
-        conn.close()
-
+    success = backup_to_github()
+    return jsonify({"success": success})
 
 @app.route('/admin/restore', methods=['POST'])
 def admin_restore():
-    """Restore database from JSON backup"""
-    
+    """Admin: Manual restore"""
     data = request.get_json()
     
-    # Check admin secret
-    admin_secret = data.get('admin_secret')
-    if admin_secret != os.environ.get('UPAGER_ADMIN_SECRET', 'change-me'):
-        return jsonify({'success': False, 'error': 'Unauthorized'}), 401
+    if data.get('admin_secret') != os.environ.get('UPAGER_ADMIN_SECRET'):
+        return jsonify({"success": False, "error": "Unauthorized"}), 401
     
-    backup_data = data.get('backup')
-    if not backup_data:
-        return jsonify({
-            'success': False,
-            'error': 'No backup data provided'
-        }), 400
+    data = get_file_from_github()
+    success = import_json_to_db(data) if data else False
     
-    conn = sqlite3.connect(DB_FILE)
-    c = conn.cursor()
-    
-    try:
-        # Clear existing data
-        c.execute('DELETE FROM activations')
-        c.execute('DELETE FROM licenses')
-        
-        # Restore licenses
-        licenses = backup_data.get('licenses', [])
-        for lic in licenses:
-            c.execute('''
-                INSERT INTO licenses 
-                (id, license_key, email, type, tier, billing_type, status, 
-                 created_at, activated_at, expires_at, maintenance_expires_at, 
-                 max_activations, current_activations)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            ''', (
-                lic['id'], lic['license_key'], lic['email'], lic['type'], 
-                lic['tier'], lic['billing_type'], lic['status'], lic['created_at'],
-                lic.get('activated_at'), lic.get('expires_at'), 
-                lic.get('maintenance_expires_at'), lic['max_activations'], 
-                lic['current_activations']
-            ))
-        
-        # Restore activations
-        activations = backup_data.get('activations', [])
-        for act in activations:
-            c.execute('''
-                INSERT INTO activations
-                (id, license_key, machine_id, ip_address, activated_at, 
-                 last_verified, status)
-                VALUES (?, ?, ?, ?, ?, ?, ?)
-            ''', (
-                act['id'], act['license_key'], act['machine_id'], 
-                act.get('ip_address'), act['activated_at'], 
-                act.get('last_verified'), act['status']
-            ))
-        
-        conn.commit()
-        
-        logging.info(f"Database restored: {len(licenses)} licenses, {len(activations)} activations")
-        
-        return jsonify({
-            'success': True,
-            'message': f'Restored {len(licenses)} licenses and {len(activations)} activations',
-            'counts': {
-                'licenses': len(licenses),
-                'activations': len(activations)
-            }
-        })
-        
-    except Exception as e:
-        conn.rollback()
-        logging.error(f"Restore error: {str(e)}")
-        return jsonify({
-            'success': False,
-            'error': str(e)
-        }), 500
-    finally:
-        conn.close()
+    return jsonify({"success": success})
 
-
-@app.route('/admin/licenses', methods=['GET'])
-def admin_list_licenses():
-    """Admin endpoint to list all licenses"""
-    
-    # Check admin secret from header or query param
-    admin_secret = request.headers.get('X-Admin-Secret') or request.args.get('secret')
-    if admin_secret != os.environ.get('UPAGER_ADMIN_SECRET', 'change-me'):
-        return jsonify({'success': False, 'error': 'Unauthorized'}), 401
-    
-    conn = sqlite3.connect(DB_FILE)
-    c = conn.cursor()
-    
-    try:
-        c.execute('''
-            SELECT license_key, email, type, tier, billing_type, status, 
-                   created_at, max_activations, current_activations, expires_at
-            FROM licenses
-            ORDER BY created_at DESC
-        ''')
-        
-        licenses = []
-        for row in c.fetchall():
-            licenses.append({
-                'license_key': row[0],
-                'email': row[1],
-                'type': row[2],
-                'tier': row[3],
-                'billing_type': row[4],
-                'status': row[5],
-                'created_at': row[6],
-                'max_activations': row[7],
-                'current_activations': row[8],
-                'expires_at': row[9]
-            })
-        
-        return jsonify({
-            'success': True,
-            'licenses': licenses,
-            'count': len(licenses)
-        })
-        
-    finally:
-        conn.close()
-
-@app.route('/health', methods=['GET'])
+@app.route('/health')
 def health():
-    """Health check endpoint"""
-    return jsonify({
-        'status': 'healthy',
-        'timestamp': datetime.utcnow().isoformat()
-    })
-
-if __name__ == '__main__':
+    """Health check"""
+    github_status = "connected" if GITHUB_TOKEN else "disabled"
     
-    
-    # Create sample licenses for testing
     conn = sqlite3.connect(DB_FILE)
     c = conn.cursor()
-    c.execute('SELECT COUNT(*) FROM licenses')
-    
-    if c.fetchone()[0] == 0:
-        logging.info("Creating sample licenses...")
-        create_license('free@example.com', 'free')
-        create_license('pro_lifetime@example.com', 'pro_lifetime')
-        create_license('pro_annual@example.com', 'pro_annual')
-        create_license('enterprise@example.com', 'enterprise_lifetime')
-    
+    c.execute("SELECT COUNT(*) FROM licenses")
+    license_count = c.fetchone()[0]
     conn.close()
     
-    logging.info("Starting UPager License Server on http://0.0.0.0:5001")
+    return jsonify({
+        "status": "healthy",
+        "github": github_status,
+        "licenses": license_count,
+        "timestamp": datetime.utcnow().isoformat()
+    })
+
+# ============================================
+# RUN
+# ============================================
+
+if __name__ == '__main__':
+    logging.info("=" * 60)
+    logging.info("🚀 UPager License Server - GitHub Persistence Mode")
+    logging.info("=" * 60)
+    
     port = int(os.environ.get('PORT', 5001))
     app.run(host='0.0.0.0', port=port, debug=False)

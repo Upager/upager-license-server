@@ -1,10 +1,19 @@
-
 __pycache__/
 *.pyc
 *.pyo
 *.log
 *.db
 .env
+.venv/
+venv/
 
-# Backup files - keep these safe locally, never commit
+# Local development files
+licenses.db
+license_server.log
+
+# Backup files - never commit
 license_backup_*.json
+
+# OS files
+.DS_Store
+Thumbs.db

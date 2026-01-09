@@ -1,0 +1,31 @@
+
+🔄 Creating pro_annual license for vpatel@gracedentalnc.com...
+
+✅ License Created Successfully!
+============================================================
+License Key:      UPAGER-0905-6B83-FFFB-37E4
+Email:            vpatel@gracedentalnc.com
+Tier:             pro_annual
+Type:             N/A
+Max Activations:  20
+============================================================
+
+💾 Save this license key: UPAGER-0905-6B83-FFFB-37E4
+
+
+
+For next licenses
+
+C:\upager-license-server-deploy>python create_license.py vpatel@gracedentalnc.com pro_annual
+
+
+cd C:\upager-license-server-deploy
+
+# Pro Lifetime
+python create_license.py customer@example.com pro_lifetime
+
+# Pro Annual
+python create_license.py customer@example.com pro_annual
+
+# Enterprise Lifetime (5 activations)
+python create_license.py business@example.com enterprise_lifetime 5
